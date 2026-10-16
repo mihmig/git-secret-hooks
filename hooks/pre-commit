@@ -1,0 +1,67 @@
+#!/bin/sh
+# git-secret-hooks — не даёт закоммитить секреты (не удаляйте эту строку: по ней
+# install.sh/remove.sh узнаёт свой хук).
+# Разово обойти (если точно ложное срабатывание): git commit --no-verify
+
+git_q() { git -c core.quotepath=false "$@"; }
+staged=$(git_q diff --cached --name-only --diff-filter=ACMR)
+status=0
+
+# ---------- 1. Файлы, которые нельзя коммитить ----------
+bad=$(printf '%s\n' "$staged" | while IFS= read -r path; do
+  [ -n "$path" ] || continue
+  case "${path##*/}" in
+    .env.example|.env.sample|.env.template|.env.dist) ;;            # шаблоны — можно
+    .env|.env.*)                                        echo "$path" ;;
+    *.private.env.json)                                 echo "$path" ;;  # http-client.private.env.json
+    id_rsa|id_dsa|id_ecdsa|id_ed25519)                  echo "$path" ;;  # приватные SSH-ключи
+    *.key|*.p12|*.pfx|*.jks|*.keystore)                 echo "$path" ;;
+    .netrc|_netrc|.pgpass)                              echo "$path" ;;
+    *.tfstate|*.tfstate.backup|*.tfvars)                echo "$path" ;;
+    credentials.json|client_secret*.json|service-account*.json) echo "$path" ;;
+  esac
+done)
+
+if [ -n "$bad" ]; then
+  echo "✖ Эти файлы нельзя коммитить:" >&2
+  printf '%s\n' "$bad" | sed 's/^/    /' >&2
+  echo "  → git rm --cached <файл> и добавьте его в .gitignore" >&2
+  status=1
+fi
+
+# ---------- 2. Строки, похожие на токены, в добавляемом коде ----------
+re='[0-9]{8,10}:[A-Za-z0-9_-]{35}'                        # Telegram bot token
+re="$re|-----BEGIN ([A-Z]+ )?PRIVATE KEY-----"            # приватные ключи
+re="$re|AKIA[0-9A-Z]{16}"                                 # AWS
+re="$re|gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{40,}"  # GitHub
+re="$re|glpat-[A-Za-z0-9_-]{20}"                          # GitLab
+re="$re|xox[abprs]-[A-Za-z0-9-]{10,}"                     # Slack
+re="$re|(^|[^A-Za-z0-9])sk-(ant-|proj-)?[A-Za-z0-9_-]{20,}"  # OpenAI / Anthropic
+
+leaks=$(printf '%s\n' "$staged" | while IFS= read -r path; do
+  [ -n "$path" ] || continue
+  hits=$(git_q diff --cached -U0 --no-color --no-ext-diff -- "$path" \
+         | grep '^+' | grep -v '^+++ ' | grep -E -e "$re" | cut -c2-160)
+  [ -n "$hits" ] && { echo "  $path:"; printf '%s\n' "$hits" | sed 's/^/      /'; }
+done)
+
+if [ -n "$leaks" ]; then
+  echo "✖ Похоже на секреты в коде:" >&2
+  printf '%s\n' "$leaks" >&2
+  status=1
+fi
+
+if [ "$status" -ne 0 ]; then
+  echo "Коммит отменён. Ложное срабатывание? git commit --no-verify" >&2
+  exit 1
+fi
+
+# ---------- 3. Запустить собственный .git/hooks/pre-commit репозитория ----------
+# (глобальный core.hooksPath отключает .git/hooks, поэтому вызываем его сами)
+local_hook="$(git rev-parse --git-common-dir)/hooks/pre-commit"
+[ -x "$local_hook" ] || exit 0
+[ "${GIT_SECRET_HOOKS_CHAINED:-}" = 1 ] && exit 0        # нас уже вызывали из цепочки
+grep -q 'git-secret-hooks' "$local_hook" 2>/dev/null && exit 0  # локальный хук — это мы сами
+GIT_SECRET_HOOKS_CHAINED=1
+export GIT_SECRET_HOOKS_CHAINED
+exec "$local_hook" "$@"

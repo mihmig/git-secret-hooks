@@ -1,0 +1,6 @@
+# Окончания строк важны: хук и install.sh исполняет sh, он спотыкается на CRLF.
+# .cmd наоборот надёжнее держать в CRLF.
+*               text=auto
+*.sh            text eol=lf
+hooks/pre-commit text eol=lf
+*.cmd           text eol=crlf
